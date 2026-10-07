@@ -44,7 +44,17 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             {check["name"] for check in checks["checks"]},
-            {"store", "interlock", "ammonia", "temp", "compressors", "fans", "evap", "rooms"},
+            {
+                "store",
+                "interlock",
+                "ammonia",
+                "temp",
+                "compressors",
+                "fans",
+                "evap",
+                "rooms",
+                "reconcile",
+            },
         )
 
         status, snapshot = self.call("GET", "/snapshot")
@@ -351,13 +361,22 @@ class ConsoleCase(unittest.TestCase):
 
         self.call("POST", "/cycle", {"room_id": "", "comp_id": "", "temp": -5.0, "ppm": 1.0, "amount": 2.0})
         status, body = self.call("GET", "/audit/summary")
-        self.assertEqual(body["count"], 1)
-        self.assertEqual(body["by_kind"], {"cycle": 1})
+        self.assertEqual(body["count"], 2)
+        self.assertEqual(body["by_kind"], {"quota_add": 1, "cycle": 1})
         self.assertEqual(body["last"]["kind"], "cycle")
         status, body = self.call("POST", "/audit/filter", {"kind": "cycle"})
         self.assertEqual(len(body["entries"]), 1)
         status, body = self.call("GET", "/audit/totals")
         self.assertEqual(body["totals"]["cycle"], -5.0)
+        self.assertEqual(body["totals"]["quota_add"], 2.0)
+
+        status, grouped = self.call("GET", "/audit/grouped")
+        self.assertEqual(set(grouped["groups"]), {"quota_add", "cycle"})
+        self.assertEqual(grouped["by_kind"]["quota_add"], 1)
+        quota_leg = grouped["groups"]["quota_add"][0]
+        cycle_leg = grouped["groups"]["cycle"][0]
+        self.assertTrue(quota_leg["corr"])
+        self.assertEqual(quota_leg["corr"], cycle_leg["corr"])
 
         self.add_room("r1", 1, -20.0)
         self.add_room("r2", 2, -8.0)
@@ -386,7 +405,11 @@ class ConsoleCase(unittest.TestCase):
         self.assertFalse(body["tripped"])
         self.assertEqual(body["quota"], 2.0)
         self.assertEqual(body["cooling_load"], 19.5)
-        self.assertEqual(body["audit_count"], 1)
+        # stage leg, supply open leg, quota leg and cycle summary leg; the
+        # compressor start leg is suppressed because stage_up already ran it.
+        self.assertEqual(body["audit_count"], 4)
+        self.assertTrue(body["reconcile_ok"])
+        self.assertEqual(body["reconcile_findings"], 0)
 
         status, body = self.call(
             "POST",
@@ -405,7 +428,10 @@ class ConsoleCase(unittest.TestCase):
 
         status, body = self.call("GET", "/export/audit")
         self.assertEqual(status, 200)
-        self.assertIn("time,kind,detail,id", body)
+        self.assertIn("time,kind,target,amount,corr,detail,id", body)
+        status, body = self.call("GET", "/export/reconcile")
+        self.assertEqual(status, 200)
+        self.assertIn("quota_journal,quota_actual", body)
         status, body = self.call("GET", "/export/telemetry")
         self.assertIn("metric,value", body)
         self.assertIn("store_keys", body)

@@ -56,4 +56,12 @@ def run_checks(rt: Runtime) -> list[dict[str, str]]:
     else:
         checks.append({"name": "rooms", "status": "ok", "detail": "every room assigned"})
 
+    if rt.reconciler.has_open_errors():
+        state = rt.reconciler.state()
+        checks.append(
+            {"name": "reconcile", "status": "fail", "detail": f"{state.error_count} cross check difference(s)"}
+        )
+    else:
+        checks.append({"name": "reconcile", "status": "ok", "detail": "unit, supply and quota agree"})
+
     return checks

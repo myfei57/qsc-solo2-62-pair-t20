@@ -586,9 +586,11 @@ class ReportingCase(unittest.TestCase):
             auditor = Auditor(Store.open(f"{tmp}/state.json"))
             auditor.record("comp", "2.0000")
             columns, rows = audit_export(auditor)
-            self.assertEqual(columns, ["time", "kind", "detail", "id"])
+            self.assertEqual(
+                columns, ["time", "kind", "target", "amount", "corr", "detail", "id"]
+            )
             self.assertEqual(rows[0][1], "comp")
-            self.assertEqual(rows[0][2], "2.0000")
+            self.assertEqual(rows[0][5], "2.0000")
 
 
 if __name__ == "__main__":

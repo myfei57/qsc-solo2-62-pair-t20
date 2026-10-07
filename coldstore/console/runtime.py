@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from coldstore.ammonia import Monitor
-from coldstore.audit import Auditor
+from coldstore.audit import Auditor, Reconciler
 from coldstore.comp import Bank
 from coldstore.defrost import Controller
 from coldstore.evap import Condenser
@@ -40,3 +40,4 @@ class Runtime:
         self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)
         self.scheduler = Scheduler(store)
+        self.reconciler = Reconciler(store, self.auditor, self.compressors, self.supply, self.accumulator)

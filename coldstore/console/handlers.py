@@ -5,13 +5,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from coldstore.ammonia import validate_ppm, validate_threshold
+from coldstore.audit import flow
 from coldstore.comp import validate_stage
 from coldstore.evap import validate_baseline
 from coldstore.fan import PRIMARY, STANDBY
 from coldstore.load import validate_baseline as validate_load_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Quota, check_quota, validate_amount
-from coldstore.reporting import audit_export, telemetry_export, to_csv
+from coldstore.reporting import audit_export, reconcile_export, telemetry_export, to_csv
 from coldstore.room import validate_zone
 from coldstore.scheduler import validate_threshold as validate_schedule_threshold
 from coldstore.store import export_state
@@ -295,18 +296,25 @@ def comp_stage(server: "Server", request: Request) -> Response:
     comp_id = request.str_field("id")
     stage = request.int_field("stage")
     validate_stage(stage)
-    return json_response({"id": comp_id, "stage": server.runtime.compressors.set_stage(comp_id, stage)})
+    actual = server.runtime.compressors.set_stage(comp_id, stage)
+    records, _ = flow.comp_stage_records(comp_id, actual)
+    server.runtime.auditor.record_many(records)
+    return json_response({"id": comp_id, "stage": actual})
 
 
 def comp_start(server: "Server", request: Request) -> Response:
     comp_id = request.str_field("id")
     server.runtime.compressors.start(comp_id)
+    records, _ = flow.comp_start_records(comp_id)
+    server.runtime.auditor.record_many(records)
     return json_response({"started": comp_id, "stage": server.runtime.compressors.stage(comp_id)[0]})
 
 
 def comp_stop(server: "Server", request: Request) -> Response:
     comp_id = request.str_field("id")
     server.runtime.compressors.stop(comp_id)
+    records, _ = flow.comp_stop_records(comp_id)
+    server.runtime.auditor.record_many(records)
     return json_response({"stopped": comp_id})
 
 
@@ -349,12 +357,24 @@ def valve_state(server: "Server", request: Request) -> Response:
 
 def valve_open(server: "Server", request: Request) -> Response:
     comp_id = request.str_field("id")
-    return json_response({"id": comp_id, "position": server.runtime.supply.open_valve(comp_id)})
+    supply = server.runtime.supply
+    was_open = supply.is_open(comp_id)
+    position = supply.open_valve(comp_id)
+    if not was_open:
+        records, _ = flow.supply_open_records(comp_id)
+        server.runtime.auditor.record_many(records)
+    return json_response({"id": comp_id, "position": position})
 
 
 def valve_close(server: "Server", request: Request) -> Response:
     comp_id = request.str_field("id")
-    return json_response({"id": comp_id, "position": server.runtime.supply.close_valve(comp_id)})
+    supply = server.runtime.supply
+    was_open = supply.is_open(comp_id)
+    position = supply.close_valve(comp_id)
+    if was_open:
+        records, _ = flow.supply_close_records(comp_id)
+        server.runtime.auditor.record_many(records)
+    return json_response({"id": comp_id, "position": position})
 
 
 def valve_position(server: "Server", request: Request) -> Response:
@@ -362,10 +382,17 @@ def valve_position(server: "Server", request: Request) -> Response:
     position = request.str_field("position")
     validate_valve(position)
     supply = server.runtime.supply
+    was_open = supply.is_open(comp_id)
     if position == OPEN:
         supply.open_valve(comp_id)
+        if not was_open:
+            records, _ = flow.supply_open_records(comp_id)
+            server.runtime.auditor.record_many(records)
     else:
         supply.close_valve(comp_id)
+        if was_open:
+            records, _ = flow.supply_close_records(comp_id)
+            server.runtime.auditor.record_many(records)
     return json_response(
         {"id": comp_id, "position": supply.position(comp_id), "open": supply.is_open(comp_id)}
     )
@@ -374,14 +401,16 @@ def valve_position(server: "Server", request: Request) -> Response:
 def valve_start(server: "Server", request: Request) -> Response:
     comp_id = request.str_field("id")
     supply = server.runtime.supply
-    supply.start_with_supply(server.runtime.compressors, comp_id)
+    records = flow.sequenced_start(server.runtime.compressors, supply, comp_id)
+    server.runtime.auditor.record_many(records)
     return json_response({"started": comp_id, "open": supply.is_open(comp_id)})
 
 
 def valve_stop(server: "Server", request: Request) -> Response:
     comp_id = request.str_field("id")
     supply = server.runtime.supply
-    supply.stop_with_supply(server.runtime.compressors, comp_id)
+    records = flow.sequenced_stop(server.runtime.compressors, supply, comp_id)
+    server.runtime.auditor.record_many(records)
     return json_response({"stopped": comp_id, "position": supply.position(comp_id)})
 
 
@@ -600,7 +629,10 @@ def load_estimate(server: "Server", request: Request) -> Response:
 def quota_add(server: "Server", request: Request) -> Response:
     amount = request.float_field("amount")
     validate_amount(amount)
-    return json_response({"value": server.runtime.accumulator.add(amount)})
+    value = server.runtime.accumulator.add(amount)
+    records, _ = flow.quota_add_records(amount)
+    server.runtime.auditor.record_many(records)
+    return json_response({"value": value})
 
 
 def quota_get(server: "Server", request: Request) -> Response:
@@ -618,8 +650,10 @@ def quota_check(server: "Server", request: Request) -> Response:
 
 
 def quota_reset(server: "Server", request: Request) -> Response:
-    server.runtime.accumulator.reset()
-    return json_response({"value": server.runtime.accumulator.value()})
+    rt = server.runtime
+    records = flow.quota_reset(rt.accumulator)
+    rt.auditor.record_many(records)
+    return json_response({"value": rt.accumulator.value()})
 
 
 def audit_list(server: "Server", request: Request) -> Response:
@@ -647,6 +681,27 @@ def audit_totals(server: "Server", request: Request) -> Response:
     return json_response({"totals": server.runtime.auditor.totals()})
 
 
+def audit_grouped(server: "Server", request: Request) -> Response:
+    groups = server.runtime.auditor.grouped()
+    return json_response(
+        {
+            "groups": {
+                kind: [entry.as_dict() for entry in entries] for kind, entries in groups.items()
+            },
+            "by_kind": {kind: len(entries) for kind, entries in groups.items()},
+        }
+    )
+
+
+def reconcile_state(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.reconciler.state().as_dict())
+
+
+def reconcile_run(server: "Server", request: Request) -> Response:
+    run = server.runtime.reconciler.run()
+    return json_response(run.as_dict())
+
+
 def schedule_state(server: "Server", request: Request) -> Response:
     return json_response(server.runtime.scheduler.state(server.runtime.rooms).as_dict())
 
@@ -667,6 +722,11 @@ def schedule_plan(server: "Server", request: Request) -> Response:
 
 def export_audit(server: "Server", request: Request) -> Response:
     columns, rows = audit_export(server.runtime.auditor)
+    return csv_response(to_csv(columns, rows))
+
+
+def export_reconcile(server: "Server", request: Request) -> Response:
+    columns, rows = reconcile_export(server.runtime.reconciler)
     return csv_response(to_csv(columns, rows))
 
 
