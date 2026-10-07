@@ -31,21 +31,28 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
         rt.interlock.trip(f"ammonia {ammonia.calibrated:.2f} ppm")
         if comp_id:
             rt.supply.stop_with_supply(rt.compressors, comp_id)
+            rt.auditor.record_op("comp.stop", comp=comp_id)
+            rt.auditor.record_op("valve.close", comp=comp_id)
         tripped = True
     else:
         if comp_id:
             if rt.load.is_high(temp):
-                rt.compressors.stage_up(comp_id)
+                stage = rt.compressors.stage_up(comp_id)
             else:
-                rt.compressors.stage_down(comp_id)
+                stage = rt.compressors.stage_down(comp_id)
+            rt.auditor.record_op("comp.stage", comp=comp_id, stage=stage)
             rt.supply.start_with_supply(rt.compressors, comp_id)
+            rt.auditor.record_op("valve.open", comp=comp_id)
+            rt.auditor.record_op("comp.start", comp=comp_id)
         if defrost and room_id:
             rt.defrost.start(room_id)
         elif room_id:
             rt.defrost.finish(room_id)
 
     quota_value = rt.accumulator.add(amount)
+    rt.auditor.record_op("quota.add", amount=amount)
     rt.auditor.record("cycle", f"{temp:.4f}")
+    reconcile = rt.reconciler.maybe_run()
 
     return json_response(
         {
@@ -60,5 +67,7 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
             "quota": quota_value,
             "cooling_load": rt.load.load_for(temp),
             "audit_count": rt.auditor.count(),
+            "reconciled": reconcile is not None,
+            "reconcile_ok": reconcile.ok if reconcile else None,
         }
     )

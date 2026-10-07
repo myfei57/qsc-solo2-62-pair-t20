@@ -11,6 +11,7 @@ from coldstore.fan import FanSet
 from coldstore.interlock import Interlock
 from coldstore.load import LoadCalculator
 from coldstore.quota import Accumulator
+from coldstore.reconcile import Reconciler
 from coldstore.room import RoomRegistry
 from coldstore.scheduler import Scheduler
 from coldstore.store import Store
@@ -39,4 +40,5 @@ class Runtime:
         self.load = LoadCalculator(store)
         self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)
+        self.reconciler = Reconciler(self.auditor, self.compressors, self.supply, self.accumulator)
         self.scheduler = Scheduler(store)

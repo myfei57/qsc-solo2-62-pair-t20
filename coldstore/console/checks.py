@@ -56,4 +56,14 @@ def run_checks(rt: Runtime) -> list[dict[str, str]]:
     else:
         checks.append({"name": "rooms", "status": "ok", "detail": "every room assigned"})
 
+    latest = rt.reconciler.latest()
+    if latest is None:
+        checks.append({"name": "reconcile", "status": "warn", "detail": "never run"})
+    elif latest.get("ok"):
+        checks.append({"name": "reconcile", "status": "ok", "detail": "sources consistent"})
+    else:
+        diffs = latest.get("diffs", [])
+        count = len(diffs) if isinstance(diffs, list) else 0
+        checks.append({"name": "reconcile", "status": "warn", "detail": f"{count} diffs open"})
+
     return checks

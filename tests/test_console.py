@@ -44,7 +44,7 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             {check["name"] for check in checks["checks"]},
-            {"store", "interlock", "ammonia", "temp", "compressors", "fans", "evap", "rooms"},
+            {"store", "interlock", "ammonia", "temp", "compressors", "fans", "evap", "rooms", "reconcile"},
         )
 
         status, snapshot = self.call("GET", "/snapshot")
@@ -66,6 +66,7 @@ class ConsoleCase(unittest.TestCase):
                 "load",
                 "quota",
                 "audit",
+                "reconcile",
                 "schedule",
             },
         )
@@ -351,8 +352,8 @@ class ConsoleCase(unittest.TestCase):
 
         self.call("POST", "/cycle", {"room_id": "", "comp_id": "", "temp": -5.0, "ppm": 1.0, "amount": 2.0})
         status, body = self.call("GET", "/audit/summary")
-        self.assertEqual(body["count"], 1)
-        self.assertEqual(body["by_kind"], {"cycle": 1})
+        self.assertEqual(body["count"], 2)
+        self.assertEqual(body["by_kind"], {"quota.add": 1, "cycle": 1})
         self.assertEqual(body["last"]["kind"], "cycle")
         status, body = self.call("POST", "/audit/filter", {"kind": "cycle"})
         self.assertEqual(len(body["entries"]), 1)
@@ -372,6 +373,71 @@ class ConsoleCase(unittest.TestCase):
         _, body = self.call("GET", "/schedule")
         self.assertEqual(body["due"], ["r2", "r1"])
 
+    def test_reconcile_routes(self) -> None:
+        status, body = self.call("GET", "/reconcile")
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["report"])
+
+        self.call("POST", "/comp/add", {"id": "c1", "stages": 2})
+        self.call("POST", "/comp/start", {"id": "c1"})
+        status, report = self.call("POST", "/reconcile")
+        self.assertEqual(status, 200)
+        self.assertFalse(report["ok"])
+        self.assertTrue(report["complete"])
+        checks_found = {diff["check"] for diff in report["diffs"]}
+        self.assertIn("record_pairing", checks_found)
+        self.assertIn("running_without_supply", checks_found)
+        self.assertEqual(report["by_kind"]["comp.start"], 1)
+
+        status, body = self.call("GET", "/reconcile")
+        self.assertEqual(body["report"]["id"], report["id"])
+        status, csv = self.call("GET", "/export/reconcile")
+        self.assertIn("run_id,at,check,comp,reason,evidence", csv)
+        self.assertIn("record_pairing", csv)
+        self.assertIn("c1", csv)
+
+        status, checks = self.call("GET", "/health/checks")
+        reconcile_check = [c for c in checks["checks"] if c["name"] == "reconcile"][0]
+        self.assertEqual(reconcile_check["status"], "warn")
+
+        # differences are flagged, never blocked: operations still go through
+        status, body = self.call("POST", "/comp/stop", {"id": "c1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["stopped"], "c1")
+
+    def test_cycle_auto_reconciles_every_stride(self) -> None:
+        self.add_room("r1", 1, -5.0)
+        self.call("POST", "/comp/add", {"id": "c1", "stages": 4})
+        for _ in range(9):
+            status, body = self.call(
+                "POST",
+                "/cycle",
+                {"room_id": "r1", "comp_id": "c1", "temp": -5.0, "ppm": 1.0, "amount": 2.0},
+            )
+            self.assertFalse(body["reconciled"])
+        status, body = self.call(
+            "POST",
+            "/cycle",
+            {"room_id": "r1", "comp_id": "c1", "temp": -5.0, "ppm": 1.0, "amount": 2.0},
+        )
+        self.assertTrue(body["reconciled"])
+        self.assertTrue(body["reconcile_ok"])
+
+        status, body = self.call("GET", "/reconcile")
+        report = body["report"]
+        self.assertIsNotNone(report)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["by_kind"]["cycle"], 10)
+        self.assertEqual(report["by_kind"]["comp.start"], 10)
+        self.assertEqual(report["by_kind"]["valve.open"], 10)
+        self.assertEqual(report["by_kind"]["quota.add"], 10)
+
+        status, checks = self.call("GET", "/health/checks")
+        reconcile_check = [c for c in checks["checks"] if c["name"] == "reconcile"][0]
+        self.assertEqual(reconcile_check["status"], "ok")
+        status, csv = self.call("GET", "/export/reconcile")
+        self.assertIn("ok", csv)
+
     def test_cycle_simulation_and_exports(self) -> None:
         self.add_room("r1", 1, -5.0)
         self.call("POST", "/comp/add", {"id": "c1", "stages": 4})
@@ -386,7 +452,8 @@ class ConsoleCase(unittest.TestCase):
         self.assertFalse(body["tripped"])
         self.assertEqual(body["quota"], 2.0)
         self.assertEqual(body["cooling_load"], 19.5)
-        self.assertEqual(body["audit_count"], 1)
+        self.assertEqual(body["audit_count"], 5)
+        self.assertFalse(body["reconciled"])
 
         status, body = self.call(
             "POST",

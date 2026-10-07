@@ -5,6 +5,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from coldstore.audit import parse_detail
+from coldstore.reconcile.report import RECONCILE_KIND
+
 if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
     from coldstore.audit import Auditor
     from coldstore.console.telemetry import Telemetry
@@ -33,6 +36,36 @@ def audit_export(auditor: Auditor) -> tuple[list[str], list[list[str]]]:
 
     columns = ["time", "kind", "detail", "id"]
     rows = [[entry.time, entry.kind, entry.detail, entry.id] for entry in auditor.entries()]
+    return columns, rows
+
+
+def reconcile_export(auditor: Auditor) -> tuple[list[str], list[list[object]]]:
+    """Columns and rows flattening every reconciliation run and its diffs."""
+
+    columns = ["run_id", "at", "check", "comp", "reason", "evidence"]
+    rows: list[list[object]] = []
+    for entry in auditor.entries():
+        if entry.kind != RECONCILE_KIND:
+            continue
+        diffs = parse_detail(entry.detail).get("diffs", [])
+        if not diffs:
+            rows.append([entry.id, entry.time, "ok", "", "no diffs", ""])
+            continue
+        for diff in diffs:
+            if not isinstance(diff, dict):
+                continue
+            evidence = diff.get("evidence", [])
+            joined = ";".join(str(item) for item in evidence) if isinstance(evidence, list) else ""
+            rows.append(
+                [
+                    entry.id,
+                    entry.time,
+                    str(diff.get("check", "")),
+                    str(diff.get("comp", "")),
+                    str(diff.get("reason", "")),
+                    joined,
+                ]
+            )
     return columns, rows
 
 

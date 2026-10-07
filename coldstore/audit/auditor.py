@@ -15,6 +15,18 @@ from .report import AuditState
 AUDIT_KEY = "audit:entries"
 
 
+def parse_detail(detail: str) -> dict[str, object]:
+    """Decode a structured detail payload, or an empty mapping for plain text."""
+
+    try:
+        payload = json.loads(detail)
+    except ValueError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
 @dataclass(frozen=True)
 class Entry:
     """One recorded control decision."""
@@ -43,6 +55,11 @@ class Auditor:
         )
         append_command(self._store, AUDIT_KEY, json.dumps(entry.as_dict(), ensure_ascii=False))
         return entry
+
+    def record_op(self, kind: str, **fields: object) -> Entry:
+        """Record one operation with a structured JSON detail payload."""
+
+        return self.record(kind, json.dumps(fields, ensure_ascii=False, sort_keys=True))
 
     def entries(self) -> list[Entry]:
         entries: list[Entry] = []

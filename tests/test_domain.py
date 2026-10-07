@@ -7,7 +7,7 @@ import unittest
 
 from coldstore.ammonia import Monitor, level_for, validate_ppm
 from coldstore.ammonia import validate_threshold as validate_ammonia_threshold
-from coldstore.audit import Auditor
+from coldstore.audit import Auditor, parse_detail
 from coldstore.comp import Bank as CompressorBank
 from coldstore.comp import validate_stage
 from coldstore.defrost import Controller as DefrostController
@@ -17,6 +17,7 @@ from coldstore.interlock import Interlock
 from coldstore.load import LoadCalculator, compute_load, validate_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Accumulator, Quota, check_quota, validate_amount
+from coldstore.reconcile import Reconciler
 from coldstore.reporting import audit_export, to_csv
 from coldstore.room import RoomRegistry, validate_zone
 from coldstore.scheduler import Scheduler, validate_threshold
@@ -544,6 +545,126 @@ class AuditCase(unittest.TestCase):
             self.assertEqual(auditor.state().count, 3)
             self.assertEqual(auditor.totals(), {"comp": 3.0, "ammonia": 0.5})
             self.assertIn("audit entries=3", auditor.describe())
+
+
+class ReconcileCase(unittest.TestCase):
+    def _runtime(self, tmp: str):
+        store = Store.open(f"{tmp}/state.json")
+        auditor = Auditor(store)
+        bank = CompressorBank()
+        supply = SupplyValve(store)
+        accumulator = Accumulator(store)
+        return auditor, bank, supply, accumulator, Reconciler(auditor, bank, supply, accumulator)
+
+    def test_clean_run_groups_by_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            auditor, bank, supply, accumulator, reconciler = self._runtime(tmp)
+            bank.add_compressor("c1", 2)
+            supply.open_valve("c1")
+            bank.start("c1")
+            auditor.record_op("valve.open", comp="c1")
+            auditor.record_op("comp.start", comp="c1")
+            accumulator.add(5.0)
+            auditor.record_op("quota.add", amount=5.0)
+            report = reconciler.run()
+            self.assertTrue(report.ok)
+            self.assertTrue(report.complete)
+            self.assertTrue(report.within_budget)
+            self.assertEqual(report.diffs, [])
+            self.assertEqual(report.by_kind["comp.start"], 1)
+            self.assertEqual(report.by_kind["valve.open"], 1)
+            self.assertEqual(report.entries_scanned, 3)
+            self.assertEqual(auditor.last().kind, "reconcile")
+            self.assertTrue(parse_detail(auditor.last().detail)["ok"])
+            self.assertEqual(reconciler.latest()["id"], report.id)
+            self.assertIn("ok=True", reconciler.describe())
+
+    def test_unpaired_records_are_flagged_with_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            auditor, bank, supply, accumulator, reconciler = self._runtime(tmp)
+            bank.add_compressor("c1", 2)
+            auditor.record_op("comp.start", comp="c1")
+            auditor.record_op("comp.start", comp="c1")
+            auditor.record_op("valve.open", comp="c1")
+            report = reconciler.run()
+            self.assertFalse(report.ok)
+            pairing = [diff for diff in report.diffs if diff.check == "record_pairing"]
+            self.assertEqual(len(pairing), 1)
+            self.assertEqual(pairing[0].comp, "c1")
+            self.assertIn("2 comp.start", pairing[0].reason)
+            self.assertIn("1 valve.open", pairing[0].reason)
+            self.assertEqual(len(pairing[0].evidence), 3)
+            stored = parse_detail(auditor.last().detail)
+            self.assertEqual(stored["diffs"][0]["check"], "record_pairing")
+
+    def test_state_diffs_for_running_and_orphan_valve(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            auditor, bank, supply, accumulator, reconciler = self._runtime(tmp)
+            bank.add_compressor("c1", 2)
+            bank.start("c1")
+            supply.open_valve("ghost")
+            report = reconciler.run()
+            checks = {diff.check for diff in report.diffs}
+            self.assertIn("running_without_supply", checks)
+            self.assertIn("supply_open_unknown_comp", checks)
+            self.assertNotIn("record_pairing", checks)
+
+    def test_quota_replay_matches_across_wrap_and_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            auditor, bank, supply, accumulator, reconciler = self._runtime(tmp)
+            for amount in (60.0, 90.0):
+                accumulator.add(amount)
+                auditor.record_op("quota.add", amount=amount)
+            self.assertEqual(accumulator.value(), 50.0)
+            self.assertTrue(reconciler.run().ok)
+            accumulator.reset()
+            auditor.record_op("quota.reset")
+            accumulator.add(7.0)
+            auditor.record_op("quota.add", amount=7.0)
+            self.assertTrue(reconciler.run().ok)
+            accumulator.add(3.0)
+            report = reconciler.run()
+            quota = [diff for diff in report.diffs if diff.check == "quota_replay"]
+            self.assertEqual(len(quota), 1)
+            self.assertIn("7.0000", quota[0].reason)
+            self.assertIn("10.0000", quota[0].reason)
+
+    def test_budget_truncates_long_scans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            auditor, bank, supply, accumulator, _ = self._runtime(tmp)
+            tight = Reconciler(auditor, bank, supply, accumulator, budget_ms=-1.0)
+            for _ in range(300):
+                auditor.record_op("quota.add", amount=1.0)
+            report = tight.run()
+            self.assertFalse(report.complete)
+            self.assertFalse(report.within_budget)
+            self.assertEqual(report.entries_scanned, 256)
+            self.assertIn("budget", {diff.check for diff in report.diffs})
+            self.assertNotIn("quota_replay", {diff.check for diff in report.diffs})
+
+    def test_over_budget_run_is_marked_but_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            auditor, bank, supply, accumulator, _ = self._runtime(tmp)
+            tight = Reconciler(auditor, bank, supply, accumulator, budget_ms=-1.0)
+            auditor.record_op("quota.add", amount=1.0)
+            report = tight.run()
+            self.assertTrue(report.complete)
+            self.assertFalse(report.within_budget)
+            self.assertFalse(report.ok)
+            self.assertIn("budget", {diff.check for diff in report.diffs})
+
+    def test_stride_gates_periodic_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            auditor, bank, supply, accumulator, _ = self._runtime(tmp)
+            reconciler = Reconciler(auditor, bank, supply, accumulator, stride=3)
+            auditor.record("cycle", "-18.0000")
+            self.assertIsNone(reconciler.maybe_run())
+            auditor.record("cycle", "-18.0000")
+            auditor.record("cycle", "-18.0000")
+            self.assertTrue(reconciler.due())
+            self.assertIsNotNone(reconciler.maybe_run())
+            self.assertFalse(reconciler.due())
+            self.assertIsNone(reconciler.maybe_run())
 
 
 class SchedulerCase(unittest.TestCase):
